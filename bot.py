@@ -13,7 +13,8 @@ TOKEN = os.environ["BOT_TOKEN"]
 ADMINS = {int(x) for x in os.environ["ADMIN_IDS"].replace(" ", "").split(",") if x}
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow"))
 SNOOZE_MIN = int(os.environ.get("SNOOZE_MIN", "30"))
-DB_PATH = os.environ.get("DB_PATH", "reminders.db")
+DB_PATH = os.environ.get("DB_PATH", "data/reminders.db")
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
@@ -38,6 +39,7 @@ MENU = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="Сотрудники"), KeyboardButton(text="Добавить сотрудника")],
     [KeyboardButton(text="Отмена")]], resize_keyboard=True)
 MIN_INTERVAL = 5
+MENU_TEXTS = ["Новое напоминание", "Активные", "Сотрудники", "Добавить сотрудника", "Отмена"]
 
 class New(StatesGroup):
     text = State(); when = State(); interval = State(); count = State()
@@ -54,7 +56,8 @@ class AddEmp(StatesGroup):
 
 # ---------- регистрация ----------
 @dp.message(CommandStart())
-async def start(m: Message):
+async def start(m: Message, state: FSMContext):
+    await state.clear()
     uid = m.from_user.id
     if is_admin(uid):
         await m.answer("Вы администратор. Пользуйтесь кнопками внизу.", reply_markup=MENU)
@@ -89,7 +92,7 @@ async def addemp_btn(m: Message, state: FSMContext):
     await state.clear(); await state.set_state(AddEmp.data)
     await m.answer("Пришлите Telegram ID и имя через пробел, например: 1117238943 Ваня")
 
-@dp.message(AddEmp.data)
+@dp.message(AddEmp.data, F.text, ~F.text.in_(MENU_TEXTS), ~F.text.startswith("/"))
 async def addemp_data(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     p = m.text.split(maxsplit=1)
@@ -134,7 +137,7 @@ async def pick(c: CallbackQuery, state: FSMContext):
     await state.update_data(emp=int(c.data[3:])); await state.set_state(New.text)
     await c.message.answer("Введите точный текст напоминания."); await c.answer()
 
-@dp.message(New.text)
+@dp.message(New.text, F.text, ~F.text.in_(MENU_TEXTS), ~F.text.startswith("/"))
 async def s_text(m: Message, state: FSMContext):
     await state.update_data(text=m.text); await state.set_state(New.when)
     await m.answer(f"Когда отправить первое сообщение? Выберите кнопку или введите ДД.ММ.ГГГГ ЧЧ:ММ (часовой пояс {TZ.key}).",
@@ -151,7 +154,7 @@ async def s_when_btn(c: CallbackQuery, state: FSMContext):
     await state.update_data(ts=ts); await state.set_state(New.interval)
     await c.message.answer(f"Первая отправка: {fmt(ts)}.\nКак часто повторять?", reply_markup=IV_KB); await c.answer()
 
-@dp.message(New.when)
+@dp.message(New.when, F.text, ~F.text.in_(MENU_TEXTS), ~F.text.startswith("/"))
 async def s_when(m: Message, state: FSMContext):
     try: ts = int(datetime.strptime(m.text.strip(), "%d.%m.%Y %H:%M").replace(tzinfo=TZ).timestamp())
     except ValueError: return await m.answer("Не понял формат. Пример: 28.10.2026 10:00")
@@ -169,7 +172,7 @@ async def s_iv_btn(c: CallbackQuery, state: FSMContext):
         await state.update_data(total=1); return await card(c.message, state)
     await state.set_state(New.count); await c.message.answer("Сколько всего отправок, включая первую?", reply_markup=CNT_KB)
 
-@dp.message(New.interval)
+@dp.message(New.interval, F.text, ~F.text.in_(MENU_TEXTS), ~F.text.startswith("/"))
 async def s_int(m: Message, state: FSMContext):
     if not m.text.strip().isdigit(): return await m.answer("Введите число минут.")
     iv = int(m.text)
@@ -183,7 +186,7 @@ async def s_int(m: Message, state: FSMContext):
 async def s_cnt_btn(c: CallbackQuery, state: FSMContext):
     await state.update_data(total=int(c.data[3:])); await c.answer(); await card(c.message, state)
 
-@dp.message(New.count)
+@dp.message(New.count, F.text, ~F.text.in_(MENU_TEXTS), ~F.text.startswith("/"))
 async def s_cnt(m: Message, state: FSMContext):
     if not m.text.strip().isdigit() or not 1 <= int(m.text) <= 50: return await m.answer("Число от 1 до 50.")
     await state.update_data(total=int(m.text)); await card(m, state)
