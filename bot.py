@@ -6,7 +6,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ["BOT_TOKEN"]
@@ -33,15 +33,31 @@ def fmt(ts): return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
 def is_admin(uid): return uid in ADMINS
 def kb(rows): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in r] for r in rows])
 
+MENU = ReplyKeyboardMarkup(keyboard=[
+    [KeyboardButton(text="Новое напоминание"), KeyboardButton(text="Активные")],
+    [KeyboardButton(text="Сотрудники"), KeyboardButton(text="Добавить сотрудника")],
+    [KeyboardButton(text="Отмена")]], resize_keyboard=True)
+MIN_INTERVAL = 5
+
 class New(StatesGroup):
     text = State(); when = State(); interval = State(); count = State()
+
+IV_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="Один раз", callback_data="iv:0")],
+    [InlineKeyboardButton(text="Каждые 30 мин", callback_data="iv:30"), InlineKeyboardButton(text="Каждый час", callback_data="iv:60")],
+    [InlineKeyboardButton(text="Каждые 2 часа", callback_data="iv:120"), InlineKeyboardButton(text="Каждый день", callback_data="iv:1440")],
+    [InlineKeyboardButton(text="Свой интервал", callback_data="iv:x")]])
+CNT_KB = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=str(n), callback_data=f"ct:{n}") for n in (2, 3, 5, 10)]])
+
+class AddEmp(StatesGroup):
+    data = State()
 
 # ---------- регистрация ----------
 @dp.message(CommandStart())
 async def start(m: Message):
     uid = m.from_user.id
     if is_admin(uid):
-        await m.answer("Вы администратор.\n/new — новое напоминание\n/list — активные\n/employees — сотрудники\n/addemp ID Имя — добавить сотрудника")
+        await m.answer("Вы администратор. Пользуйтесь кнопками внизу.", reply_markup=MENU)
         return
     row = db.execute("SELECT approved FROM employees WHERE id=?", (uid,)).fetchone()
     if row and row["approved"]:
@@ -67,6 +83,25 @@ async def approve(c: CallbackQuery):
         db.execute("DELETE FROM employees WHERE id=?", (uid,)); db.commit()
         await c.message.edit_text(f"Сотрудник {uid} отклонён.")
 
+@dp.message(F.text == "Добавить сотрудника")
+async def addemp_btn(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    await state.clear(); await state.set_state(AddEmp.data)
+    await m.answer("Пришлите Telegram ID и имя через пробел, например: 1117238943 Ваня")
+
+@dp.message(AddEmp.data)
+async def addemp_data(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    p = m.text.split(maxsplit=1)
+    if len(p) < 2 or not p[0].isdigit(): return await m.answer("Формат: ID и имя, например: 1117238943 Ваня")
+    db.execute("INSERT OR REPLACE INTO employees(id,name,approved) VALUES(?,?,1)", (int(p[0]), p[1])); db.commit()
+    await state.clear()
+    await m.answer("Сотрудник добавлен. Он должен один раз нажать Start у бота, иначе Telegram не даст писать ему.", reply_markup=MENU)
+
+@dp.message(F.text == "Отмена")
+async def cancel_btn(m: Message, state: FSMContext):
+    await state.clear(); await m.answer("Отменено.", reply_markup=MENU if is_admin(m.from_user.id) else None)
+
 @dp.message(Command("addemp"))
 async def addemp(m: Message):
     if not is_admin(m.from_user.id): return
@@ -76,17 +111,20 @@ async def addemp(m: Message):
     await m.answer("Сотрудник добавлен. Он должен один раз нажать /start у бота, иначе Telegram не даст писать ему.")
 
 @dp.message(Command("employees"))
-async def emps(m: Message):
+@dp.message(F.text == "Сотрудники")
+async def emps(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
+    await state.clear()
     rows = db.execute("SELECT * FROM employees WHERE approved=1").fetchall()
-    await m.answer("\n".join(f"{r['name']} — {r['id']}" for r in rows) or "Сотрудников нет. Добавьте: /addemp ID Имя")
+    await m.answer("\n".join(f"{r['name']} — {r['id']}" for r in rows) or "Сотрудников нет. Нажмите «Добавить сотрудника».")
 
 # ---------- создание ----------
 @dp.message(Command("new"))
+@dp.message(F.text == "Новое напоминание")
 async def new(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     rows = db.execute("SELECT * FROM employees WHERE approved=1").fetchall()
-    if not rows: return await m.answer("Сначала добавьте сотрудника: /addemp ID Имя")
+    if not rows: return await m.answer("Сначала добавьте сотрудника кнопкой «Добавить сотрудника».")
     await state.clear()
     await m.answer("Кому напомнить?", reply_markup=kb([[(r["name"], f"to:{r['id']}")] for r in rows]))
 
@@ -99,7 +137,19 @@ async def pick(c: CallbackQuery, state: FSMContext):
 @dp.message(New.text)
 async def s_text(m: Message, state: FSMContext):
     await state.update_data(text=m.text); await state.set_state(New.when)
-    await m.answer(f"Дата и время первой отправки в формате ДД.ММ.ГГГГ ЧЧ:ММ (часовой пояс {TZ.key}).")
+    await m.answer(f"Когда отправить первое сообщение? Выберите кнопку или введите ДД.ММ.ГГГГ ЧЧ:ММ (часовой пояс {TZ.key}).",
+                   reply_markup=kb([[("Через 5 минут", "wh:5"), ("Через 1 час", "wh:60")], [("Завтра в 10:00", "wh:tm10")]]))
+
+@dp.callback_query(F.data.startswith("wh:"), New.when)
+async def s_when_btn(c: CallbackQuery, state: FSMContext):
+    v = c.data[3:]
+    if v == "tm10":
+        t = datetime.now(TZ).replace(hour=10, minute=0, second=0, microsecond=0)
+        ts = int(t.timestamp()) + 86400
+    else:
+        ts = int(time.time()) + int(v) * 60
+    await state.update_data(ts=ts); await state.set_state(New.interval)
+    await c.message.answer(f"Первая отправка: {fmt(ts)}.\nКак часто повторять?", reply_markup=IV_KB); await c.answer()
 
 @dp.message(New.when)
 async def s_when(m: Message, state: FSMContext):
@@ -107,15 +157,31 @@ async def s_when(m: Message, state: FSMContext):
     except ValueError: return await m.answer("Не понял формат. Пример: 28.10.2026 10:00")
     if ts < time.time(): return await m.answer("Это время уже прошло. Введите будущее.")
     await state.update_data(ts=ts); await state.set_state(New.interval)
-    await m.answer("Интервал повтора в минутах (например 120). 0 — один раз.")
+    await m.answer("Как часто повторять?", reply_markup=IV_KB)
+
+@dp.callback_query(F.data.startswith("iv:"), New.interval)
+async def s_iv_btn(c: CallbackQuery, state: FSMContext):
+    v = c.data[3:]
+    if v == "x":
+        await c.message.answer(f"Введите интервал в минутах (не меньше {MIN_INTERVAL})."); return await c.answer()
+    iv = int(v); await state.update_data(iv=iv); await c.answer()
+    if iv == 0:
+        await state.update_data(total=1); return await card(c.message, state)
+    await state.set_state(New.count); await c.message.answer("Сколько всего отправок, включая первую?", reply_markup=CNT_KB)
 
 @dp.message(New.interval)
 async def s_int(m: Message, state: FSMContext):
     if not m.text.strip().isdigit(): return await m.answer("Введите число минут.")
-    iv = int(m.text); await state.update_data(iv=iv)
+    iv = int(m.text)
+    if iv != 0 and iv < MIN_INTERVAL: return await m.answer(f"Минимальный интервал — {MIN_INTERVAL} минут.")
+    await state.update_data(iv=iv)
     if iv == 0:
         await state.update_data(total=1); return await card(m, state)
-    await state.set_state(New.count); await m.answer("Сколько всего отправок, включая первую?")
+    await state.set_state(New.count); await m.answer("Сколько всего отправок, включая первую?", reply_markup=CNT_KB)
+
+@dp.callback_query(F.data.startswith("ct:"), New.count)
+async def s_cnt_btn(c: CallbackQuery, state: FSMContext):
+    await state.update_data(total=int(c.data[3:])); await c.answer(); await card(c.message, state)
 
 @dp.message(New.count)
 async def s_cnt(m: Message, state: FSMContext):
@@ -141,8 +207,10 @@ async def confirm(c: CallbackQuery, state: FSMContext):
     await state.clear(); await c.message.edit_text(f"Напоминание №{cur.lastrowid} создано.")
 
 @dp.message(Command("list"))
-async def lst(m: Message):
+@dp.message(F.text == "Активные")
+async def lst(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
+    await state.clear()
     rows = db.execute("SELECT r.*, e.name FROM reminders r JOIN employees e ON e.id=r.emp_id WHERE status='active'").fetchall()
     if not rows: return await m.answer("Активных нет.")
     for r in rows:
@@ -188,10 +256,12 @@ async def scheduler():
                                            reply_markup=kb([[("Готово", f"done:{r['id']}"), ("Отложить", f"snz:{r['id']}")]]))
                     db.execute("INSERT INTO log VALUES(?,?,1,'sent')", (now, r["id"]))
                 except Exception as e:
+                    db.execute("UPDATE reminders SET status='failed' WHERE id=?", (r["id"],))
                     db.execute("INSERT INTO log VALUES(?,?,0,?)", (now, r["id"], str(e)[:200]))
                     for a in ADMINS:
-                        try: await bot.send_message(a, f"Ошибка отправки задачи №{r['id']}: {e}")
+                        try: await bot.send_message(a, f"Задача №{r['id']} остановлена: не удалось доставить сообщение ({e}). Возможно, сотрудник не нажал Start у бота.")
                         except Exception: pass
+                    db.commit(); continue
                 db.commit()
                 if n >= r["total"]:
                     for a in ADMINS:
